@@ -1,11 +1,12 @@
-# WhatsApp Gateway — Baileys
+# WhatsApp Gateway — whatsapp-web.js
 
-Stable Node.js WhatsApp Gateway using Express and Baileys.
+Stable Node.js WhatsApp Gateway using Express and whatsapp-web.js.
 
 ## Requirements
 
 - Node.js 20+
 - A WhatsApp account for device linking
+- Chromium/Chrome managed by Puppeteer, installed by `whatsapp-web.js`
 
 ## Install
 
@@ -24,7 +25,7 @@ Set a real `API_KEY` in `.env` before exposing the API outside localhost.
 npm start
 ```
 
-On the first run, scan the QR code shown in the terminal from WhatsApp → Settings → Linked devices → Link a device. The session is persisted under `WHATSAPP_SESSION_PATH` and is reused after restart.
+On the first run, scan the QR code shown in the terminal from WhatsApp → Settings → Linked devices → Link a device. The LocalAuth session is persisted under `WHATSAPP_SESSION_PATH` and reused after restart.
 
 ## API
 
@@ -38,7 +39,7 @@ Returns the current gateway state.
 
 ### GET /qr
 
-Returns the current QR payload when login is required.
+Returns whether a QR login is currently required. The QR is also rendered in the terminal.
 
 ### POST /send-message
 
@@ -72,7 +73,7 @@ Supported phone formats include `081234567890`, `6281234567890`, and `+628123456
 
 ### POST /logout
 
-Logs out the currently connected WhatsApp account. A new QR/login is required afterwards.
+Logs out the currently connected WhatsApp account, clears the LocalAuth session, and requires a new QR/login afterwards.
 
 ## Architecture
 
@@ -81,9 +82,13 @@ Express API
     ↓
 WhatsAppManager
     ↓
-Single Baileys Socket
+Single whatsapp-web.js Client
     ↓
-WhatsApp
+WhatsApp Web
 ```
 
-Connection state is centralized and reconnect uses bounded exponential backoff. Credentials are saved through Baileys `creds.update`.
+Connection state is centralized. Only one client instance is maintained at a time, reconnect uses bounded exponential backoff, and messages are rejected until the `ready` event has established an operational client.
+
+## Environment
+
+See `.env.example`. Do not commit `.env`, session directories, `node_modules`, or logs.
