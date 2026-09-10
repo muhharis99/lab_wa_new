@@ -1,0 +1,15 @@
+2025/01/21-17:50:42.371 318c Reusing MANIFEST C:\laragon\www\lab_wa_gateway\tokens\session\Default\Service Worker\Database/MANIFEST-000001
+2025/01/21-17:50:42.393 318c Recovering log #3
+2025/01/21-17:50:42.397 318c Reusing old log C:\laragon\www\lab_wa_gateway\tokens\session\Default\Service Worker\Database/000003.log 
+2025/01/25-10:24:38.214 318c Level-0 table #5: started
+2025/01/25-10:24:38.220 318c Level-0 table #5: 90211 bytes OK
+2025/01/25-10:24:38.222 318c Delete type=0 #3
+2025/02/03-12:30:02.072 318c Level-0 table #7: started
+2025/02/03-12:30:02.077 318c Level-0 table #7: 88425 bytes OK
+2025/02/03-12:30:02.079 318c Delete type=0 #4
+2025/02/08-11:08:50.852 318c Compacting 1@1 + 1@2 files
+2025/02/08-11:08:50.862 318c Generated table #8@1: 11 keys, 688 bytes
+2025/02/08-11:08:50.862 318c Compacted 1@1 + 1@2 files => 688 bytes
+2025/02/08-11:08:50.864 318c compacted to: files[ 0 0 1 0 0 0 0 ]
+2025/02/08-11:08:50.865 318c Delete type=2 #5
+2025/02/08-11:08:50.865 318c Delete type=2 #7

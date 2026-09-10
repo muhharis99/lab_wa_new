@@ -1,0 +1,26 @@
+2024/12/28-16:20:59.423 1980 Reusing MANIFEST C:\laragon\www\lab_wa_gateway\tokens\session\Default\Local Storage\leveldb/MANIFEST-000001
+2024/12/28-16:20:59.437 1980 Recovering log #118
+2024/12/28-16:20:59.437 1980 Level-0 table #122: started
+2024/12/28-16:20:59.440 1980 Level-0 table #122: 15002 bytes OK
+2024/12/28-16:20:59.442 1980 Delete type=0 #118
+2024/12/29-08:21:55.060 2c7c Level-0 table #125: started
+2024/12/29-08:21:55.064 2c7c Level-0 table #125: 13747 bytes OK
+2024/12/29-08:21:55.066 2c7c Delete type=0 #123
+2024/12/29-13:52:11.631 2c7c Level-0 table #127: started
+2024/12/29-13:52:11.635 2c7c Level-0 table #127: 15079 bytes OK
+2024/12/29-13:52:11.638 2c7c Delete type=0 #124
+2024/12/29-23:24:32.805 2c7c Level-0 table #129: started
+2024/12/29-23:24:32.810 2c7c Level-0 table #129: 13631 bytes OK
+2024/12/29-23:24:32.813 2c7c Delete type=0 #126
+2024/12/29-23:24:32.814 2c7c Compacting 4@0 + 1@1 files
+2024/12/29-23:24:32.821 2c7c Generated table #130@0: 69 keys, 5355 bytes
+2024/12/29-23:24:32.822 2c7c Compacted 4@0 + 1@1 files => 5355 bytes
+2024/12/29-23:24:32.823 2c7c compacted to: files[ 0 1 1 0 0 0 0 ]
+2024/12/29-23:24:32.824 2c7c Delete type=2 #120
+2024/12/29-23:24:32.825 2c7c Delete type=2 #122
+2024/12/29-23:24:32.825 2c7c Delete type=2 #125
+2024/12/29-23:24:32.825 2c7c Delete type=2 #127
+2024/12/29-23:24:32.825 2c7c Delete type=2 #129
+2024/12/30-08:13:08.462 2c7c Level-0 table #132: started
+2024/12/30-08:13:08.467 2c7c Level-0 table #132: 14565 bytes OK
+2024/12/30-08:13:08.469 2c7c Delete type=0 #128
