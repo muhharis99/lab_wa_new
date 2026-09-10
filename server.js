@@ -63,6 +63,53 @@ app.get('/qr', (req, res) => {
   });
 });
 
+app.post('/send', async (req, res) => {
+  try {
+    const { numbers, message } = req.body || {};
+    if (typeof numbers !== 'string' || typeof message !== 'string' || !numbers.trim() || !message.trim()) {
+      return res.status(400).json({ success: false, message: 'numbers dan message wajib diisi' });
+    }
+
+    const noReg = message.substring(0, 7);
+    if (!/^\d{7}$/.test(noReg)) {
+      return res.status(400).json({ success: false, message: 'Format no_reg pada awal message tidak valid' });
+    }
+
+    const caption = message.substring(7).trim();
+    const pdfBaseUrl = process.env.LAB_PDF_BASE_URL || 'http://192.168.0.16/serverx/assets/rme/pdf/172.16.18.18';
+    const pdfUrl = `${pdfBaseUrl.replace(/\/$/, '')}/Hasil-Pemeriksaan-Laboratorium-${noReg}.pdf`;
+    const list = numbers.split(',').map((number) => number.trim()).filter(Boolean);
+
+    whatsapp.assertReady();
+
+    const results = [];
+    for (const phone of list) {
+      try {
+        const result = await whatsapp.sendPdf(phone, pdfUrl, caption);
+        results.push({ success: true, ...result, pdfUrl });
+      } catch (error) {
+        logger.error({ err: error, phone }, 'Legacy /send failed');
+        results.push({ success: false, phone, message: error.message, pdfUrl });
+      }
+      if (list.length > 1 && whatsapp.messageDelay > 0) await new Promise((resolve) => setTimeout(resolve, whatsapp.messageDelay));
+    }
+
+    const failed = results.filter((item) => !item.success).length;
+    return res.status(failed ? 207 : 200).json({
+      success: failed === 0,
+      data: results,
+      no_reg: noReg,
+      pdfUrl,
+    });
+  } catch (error) {
+    logger.error({ err: error }, 'Legacy /send error');
+    return res.status(error.code === 'WHATSAPP_NOT_READY' ? 503 : 400).json({
+      success: false,
+      message: error.message,
+    });
+  }
+});
+
 app.post('/send-message', requireApiKey, async (req, res) => {
   try {
     const { phone, message } = req.body || {};
