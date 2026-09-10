@@ -11,6 +11,9 @@ const port = Number(process.env.PORT || 9000);
 const host = process.env.HOST || '0.0.0.0';
 const apiKey = process.env.API_KEY || '';
 
+const LAB_PDF_BASE_URL = process.env.LAB_PDF_BASE_URL || 'http://192.168.0.16/serverx/assets/rme/pdf/172.16.18.18';
+const LAB_PDF_PREFIX = process.env.LAB_PDF_PREFIX || 'Hasil-Pemeriksaan-Laboratorium-';
+
 app.disable('x-powered-by');
 app.use(cors({ origin: process.env.CORS_ORIGIN || '*', methods: ['GET', 'POST'] }));
 app.use(express.json({ limit: process.env.JSON_LIMIT || '2mb' }));
@@ -22,6 +25,12 @@ function requireApiKey(req, res, next) {
   const provided = req.get('X-API-KEY');
   if (!provided || provided !== apiKey) return res.status(401).json({ success: false, message: 'Unauthorized' });
   next();
+}
+
+function buildLabPdfUrl(noReg) {
+  const cleanNoReg = String(noReg || '').replace(/[^A-Za-z0-9._-]/g, '');
+  if (!cleanNoReg) throw new Error('Nomor registrasi tidak valid.');
+  return `${LAB_PDF_BASE_URL.replace(/\/$/, '')}/${LAB_PDF_PREFIX}${cleanNoReg}.pdf`;
 }
 
 app.get('/health', (req, res) => {
@@ -42,18 +51,43 @@ app.get('/', (req, res) => {
 
 app.post('/send', async (req, res) => {
   const numbers = String(req.body?.numbers || '').trim();
-  const message = String(req.body?.message || '').trim();
-  if (!numbers || !message) return res.status(422).json({ success: false, message: 'Nomor dan pesan WhatsApp wajib diisi.' });
-  const list = numbers.split(',').map((value) => value.trim()).filter(Boolean);
-  try { whatsapp.assertReady(); } catch (error) { return res.status(503).json({ success: false, message: error.message, state: whatsapp.getStatus().state }); }
+  const message = String(req.body?.message || '');
+
+  if (!numbers || !message.trim()) return res.status(422).json({ success: false, message: 'Nomor dan pesan WhatsApp wajib diisi.' });
+
+  const noReg = message.substring(0, 7).trim();
+  const caption = message.substring(7).trim();
+
+  if (!/^\d{7}$/.test(noReg)) {
+    return res.status(422).json({ success: false, message: 'Format nomor registrasi pada message tidak valid. 7 karakter pertama harus nomor registrasi.' });
+  }
+
+  let pdfUrl;
+  try {
+    pdfUrl = buildLabPdfUrl(noReg);
+  } catch (error) {
+    return res.status(422).json({ success: false, message: error.message });
+  }
+
+  const list = [...new Set(numbers.split(',').map((value) => value.trim()).filter(Boolean))];
+
+  try { whatsapp.assertReady(); }
+  catch (error) { return res.status(503).json({ success: false, message: error.message, state: whatsapp.getStatus().state }); }
+
   const results = [];
   for (const phone of list) {
-    try { results.push({ success: true, ...await whatsapp.sendText(phone, message) }); }
-    catch (error) { logger.error({ err: error, phone }, 'WhatsApp /send failed'); results.push({ success: false, phone, message: error.message || String(error) }); }
+    try {
+      const result = await whatsapp.sendPdf(phone, pdfUrl, caption);
+      results.push({ success: true, ...result, noReg, pdfUrl });
+    } catch (error) {
+      logger.error({ err: error, phone, noReg, pdfUrl }, 'WhatsApp /send PDF failed');
+      results.push({ success: false, phone, noReg, pdfUrl, message: error.message || String(error) });
+    }
     if (list.length > 1 && whatsapp.messageDelay > 0) await new Promise((resolve) => setTimeout(resolve, whatsapp.messageDelay));
   }
+
   const failed = results.filter((item) => !item.success).length;
-  return res.status(failed ? 207 : 200).json({ success: failed === 0, data: results });
+  return res.status(failed ? 207 : 200).json({ success: failed === 0, noReg, pdfUrl, data: results });
 });
 
 app.post('/send-message', requireApiKey, async (req, res) => {
