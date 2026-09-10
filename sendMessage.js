@@ -1,247 +1,138 @@
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
-const qrcodeTerminal = require('qrcode-terminal');
-const QRCode = require('qrcode');
-const axios = require('axios');
-const fs = require('fs');
 const path = require('path');
+const qrcode = require('qrcode-terminal');
+const P = require('pino');
+const { Boom } = require('@hapi/boom');
+const baileys = require('@whiskeysockets/baileys');
+const makeWASocket = baileys.default;
+const {
+  DisconnectReason,
+  useMultiFileAuthState,
+  makeCacheableSignalKeyStore,
+  Browsers,
+  jidNormalizedUser,
+} = baileys;
 
-let client;
-let clientReady = false;
-let waitingConnect = false;
-let isResetting = false; 
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const CONFIG = {
-  MESSAGE_DELAY: 4000,
-  READY_TIMEOUT: 60000,
-  DOWNLOAD_TIMEOUT: 30000,
-};
+function normalizePhone(input) {
+  if (typeof input !== 'string') throw new Error('Nomor WhatsApp harus berupa string');
+  let value = input.trim().replace(/[^0-9+]/g, '');
+  if (value.startsWith('+')) value = value.slice(1);
+  if (value.startsWith('0')) value = `62${value.slice(1)}`;
+  else if (value.startsWith('8')) value = `62${value}`;
+  if (!/^62\d{8,14}$/.test(value)) throw new Error('Format nomor WhatsApp tidak valid');
+  return value;
+}
 
-function createClient() {
-  client = new Client({
-    authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth' }),
-    puppeteer: {
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process',
-      ],
-    },
-    bypassCSP: true,
-    takeoverOnConflict: true,
-    takeoverTimeoutMs: 0,
-    patchMessageBeforeSending: (message) => {
-      if (message?.markedUnread !== undefined) delete message.markedUnread;
-      return message;
-    },
-  });
+class WhatsAppManager {
+  constructor({ logger = P({ level: process.env.LOG_LEVEL || 'info' }) } = {}) {
+    this.logger = logger;
+    this.sock = null;
+    this.state = 'DISCONNECTED';
+    this.qr = null;
+    this.authenticated = false;
+    this.connected = false;
+    this.ready = false;
+    this.starting = null;
+    this.reconnectTimer = null;
+    this.reconnectAttempt = 0;
+    this.stopped = false;
+    this.sessionPath = path.resolve(process.env.WHATSAPP_SESSION_PATH || './tokens/session01');
+    this.maxReconnectDelay = Number(process.env.MAX_RECONNECT_DELAY_MS || 30000);
+  }
 
-  client.on('qr', async (qr) => {
-    console.log('\n📸 Scan QR berikut untuk login WhatsApp:\n');
-    qrcodeTerminal.generate(qr, { small: true });
-    try {
-      await QRCode.toFile('./qr_code.png', qr);
-      console.log('🖼️ QR disimpan: ./qr_code.png');
-    } catch (err) {
-      console.error('❌ Gagal simpan QR:', err.message);
+  getStatus() {
+    return { state: this.state, connected: this.connected, ready: this.ready, authenticated: this.authenticated, qr: this.qr, sessionPath: this.sessionPath, reconnectAttempt: this.reconnectAttempt };
+  }
+
+  async start() {
+    if (this.starting) return this.starting;
+    this.stopped = false;
+    this.starting = this.connect();
+    try { await this.starting; } finally { this.starting = null; }
+  }
+
+  async connect() {
+    if (this.stopped) return;
+    if (this.sock && (this.connected || this.state === 'CONNECTING' || this.state === 'AUTHENTICATED')) return;
+    this.state = 'CONNECTING'; this.connected = false; this.ready = false; this.qr = null;
+    this.logger.info('WhatsApp connecting');
+
+    const { state, saveCreds } = await useMultiFileAuthState(this.sessionPath);
+    const logger = P({ level: process.env.BAILEYS_LOG_LEVEL || 'silent' });
+    const sock = makeWASocket({
+      auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
+      logger,
+      browser: Browsers.ubuntu('Chrome'),
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
+      generateHighQualityLinkPreview: false,
+      connectTimeoutMs: Number(process.env.CONNECT_TIMEOUT_MS || 60000),
+      defaultQueryTimeoutMs: Number(process.env.QUERY_TIMEOUT_MS || 60000),
+    });
+
+    this.sock = sock;
+    this.authenticated = Boolean(state.creds.registered);
+    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('connection.update', (update) => this.handleConnectionUpdate(sock, update));
+    if (state.creds.registered) { this.state = 'AUTHENTICATED'; this.logger.info('WhatsApp session restored'); }
+  }
+
+  handleConnectionUpdate(sock, update) {
+    if (this.sock !== sock) return;
+    const { connection, lastDisconnect, qr } = update;
+    if (qr) { this.qr = qr; this.authenticated = false; this.connected = false; this.ready = false; this.state = 'QR_REQUIRED'; this.logger.info('WhatsApp QR generated'); qrcode.generate(qr, { small: true }); }
+    if (connection === 'connecting') { this.state = 'CONNECTING'; this.connected = false; this.ready = false; this.logger.info('WhatsApp connecting'); }
+    if (connection === 'open') { this.qr = null; this.authenticated = true; this.connected = true; this.ready = true; this.state = 'READY'; this.reconnectAttempt = 0; this.logger.info('WhatsApp CONNECTED & READY'); return; }
+    if (connection === 'close') {
+      this.connected = false; this.ready = false;
+      const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      const loggedOut = statusCode === DisconnectReason.loggedOut;
+      if (loggedOut) { this.authenticated = false; this.state = 'LOGGED_OUT'; this.qr = null; this.logger.warn({ statusCode }, 'WhatsApp logged out'); return; }
+      this.state = 'RECONNECTING'; this.logger.warn({ statusCode }, 'WhatsApp connection closed'); this.scheduleReconnect();
     }
-  });
+  }
 
-  client.on('authenticated', async () => {
-    console.log('🔐 WhatsApp authenticated');
-    if (!waitingConnect) {
-      waitingConnect = true;
-      await waitUntilConnected();
+  scheduleReconnect() {
+    if (this.stopped || this.reconnectTimer || this.starting) return;
+    const delayMs = Math.min(1000 * 2 ** this.reconnectAttempt, this.maxReconnectDelay);
+    this.reconnectAttempt += 1;
+    this.reconnectTimer = setTimeout(async () => { this.reconnectTimer = null; if (this.stopped) return; try { await this.start(); } catch (error) { this.logger.error({ err: error }, 'WhatsApp reconnect failed'); this.scheduleReconnect(); } }, delayMs);
+    this.logger.info({ delayMs, attempt: this.reconnectAttempt }, 'WhatsApp reconnect scheduled');
+  }
+
+  assertReady() {
+    if (!this.sock || !this.connected || !this.ready || this.state !== 'READY') { const error = new Error('WhatsApp is not ready'); error.code = 'WHATSAPP_NOT_READY'; throw error; }
+  }
+
+  async sendText(phone, message) {
+    const normalized = normalizePhone(phone);
+    if (typeof message !== 'string' || !message.trim()) throw new Error('Message wajib diisi');
+    this.assertReady();
+    const jid = jidNormalizedUser(`${normalized}@s.whatsapp.net`);
+    const result = await this.sock.sendMessage(jid, { text: message });
+    this.logger.info({ phone: normalized }, 'WhatsApp message sent');
+    return { phone: normalized, messageId: result?.key?.id || null };
+  }
+
+  async sendBulk(numbers, message, delayMs = Number(process.env.MESSAGE_DELAY_MS || 1500)) {
+    this.assertReady();
+    const list = [...new Set(numbers.map((number) => normalizePhone(String(number))))];
+    const results = [];
+    for (const phone of list) {
+      try { results.push({ success: true, ...(await this.sendText(phone, message)) }); }
+      catch (error) { results.push({ success: false, phone, message: error.message }); this.logger.error({ err: error, phone }, 'WhatsApp message failed'); }
+      if (delayMs > 0) await delay(delayMs);
     }
-  });
-
-  client.on('ready', () => {
-    console.log('ℹ️ Event ready terpanggil');
-  });
-
-  client.on('auth_failure', (msg) => {
-    console.error('❌ Auth failure:', msg);
-    clientReady = false;
-  });
-
-  client.on('disconnected', async (reason) => {
-    console.log('⚠️ WhatsApp disconnected:', reason);
-    clientReady = false;
-    waitingConnect = false;
-    if (reason === 'LOGOUT') await cleanupSession();
-  });
-
-  return client;
-}
-
-async function waitUntilConnected() {
-  const start = Date.now();
-  while (Date.now() - start < CONFIG.READY_TIMEOUT) {
-    try {
-      const state = await client.getState();
-      if (state === 'CONNECTED') {
-        clientReady = true;
-        console.log('🟢 WhatsApp CONNECTED & SIAP KIRIM');
-        return;
-      }
-    } catch {}
-    await delay(1000);
-  }
-  console.error('❌ Timeout: WhatsApp tidak CONNECTED');
-}
-
-
-async function resetClient() {
-  if (isResetting) {
-    console.log('🔄 Reset sudah berjalan, tunggu...');
-
-    const start = Date.now();
-    while (isResetting && Date.now() - start < 30000) {
-      await delay(1000);
-    }
-    return;
+    return results;
   }
 
-  isResetting = true;
-  clientReady = false;
-  waitingConnect = false;
-
-  console.log('🔄 Mereset WhatsApp client...');
-  try {
-    await client.destroy();
-  } catch (e) {
-    console.log('ℹ️ destroy error (diabaikan):', e.message);
-  }
-
-  await delay(3000);
-  createClient();
-  client.initialize();
-
-
-  const start = Date.now();
-  while (Date.now() - start < CONFIG.READY_TIMEOUT) {
-    if (clientReady) break;
-    await delay(1000);
-  }
-
-  isResetting = false;
-
-  if (!clientReady) {
-    throw new Error('Gagal reconnect setelah reset');
-  }
-
-  console.log('✅ Client berhasil direset & reconnected');
-}
-
-const delay = (ms) => new Promise(res => setTimeout(res, ms));
-
-function normalizeNumber(number) {
-  const n = number.replace(/\D/g, '');
-  if (n.startsWith('0')) return '62' + n.slice(1);
-  if (n.startsWith('8')) return '62' + n;
-  return n;
-}
-
-async function downloadPDF(url) {
-  const res = await axios.get(url, {
-    responseType: 'arraybuffer',
-    timeout: CONFIG.DOWNLOAD_TIMEOUT,
-  });
-  const buffer = Buffer.from(res.data);
-  if (buffer.length / 1024 / 1024 > 16)
-    throw new Error('PDF lebih dari 16MB');
-  return new MessageMedia('application/pdf', buffer.toString('base64'), 'Hasil-Lab.pdf');
-}
-
-async function cleanupSession() {
-  try {
-    console.log('🧹 Membersihkan session...');
-    if (client) await client.destroy().catch(() => {});
-    const sessionPath = path.join(__dirname, '.wwebjs_auth');
-    if (fs.existsSync(sessionPath)) {
-      fs.rmSync(sessionPath, { recursive: true, force: true });
-    }
-    setTimeout(() => { createClient(); client.initialize(); }, 3000);
-  } catch (e) {
-    console.error('❌ Cleanup gagal:', e.message);
+  async logout() {
+    this.stopped = true;
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    const sock = this.sock; this.sock = null; this.connected = false; this.ready = false; this.authenticated = false; this.qr = null; this.state = 'LOGGED_OUT';
+    if (sock) { try { await sock.logout(); } catch (error) { this.logger.warn({ err: error }, 'WhatsApp logout returned an error'); } }
   }
 }
 
-
-function isProtocolError(err) {
-  return (
-    err?.message?.includes('Target closed') ||
-    err?.message?.includes('Protocol error') ||
-    err?.message?.includes('Session closed') ||
-    err?.name === 'ProtocolError'
-  );
-}
-
-const sendMessage = async (numbers, message) => {
-  if (!clientReady) {
-
-    console.log('⚠️ Client belum ready, mencoba reset...');
-    await resetClient();
-  }
-
-  const list = numbers.split(',').map(n => n.trim()).filter(Boolean);
-  const results = [];
-
-  for (const number of list) {
-    let retries = 2;  
-
-    while (retries >= 0) {
-      try {
-        const no_reg   = message.substring(0, 7);
-        const caption  = message.substring(7).trim();
-        const intl     = normalizeNumber(number);
-        const chatId   = `${intl}@s.whatsapp.net`;
-        const pdfUrl   = `http://192.168.0.16/serverx/assets/rme/pdf/172.16.18.18/Hasil-Pemeriksaan-Laboratorium-${no_reg}.pdf`;
-
-        const media = await downloadPDF(pdfUrl);
-
-        await client.sendMessage(chatId, media, {
-          caption,
-          sendSeen: false,
-        });
-
-        console.log(`✅ Terkirim ke ${intl}`);
-        results.push({ number: intl, status: 1, message: 'Terkirim' });
-        break;
-
-      } catch (e) {
-        if (isProtocolError(e) && retries > 0) {
-
-          console.warn(`⚠️ ProtocolError ke ${number}, mencoba reset client... (sisa retry: ${retries})`);
-          try {
-            await resetClient();
-          } catch (resetErr) {
-            console.error('❌ Reset gagal:', resetErr.message);
-            results.push({ number, status: 2, message: resetErr.message });
-            break;
-          }
-          retries--;
-          continue;
-        }
-
-        console.error(`❌ Gagal ke ${number}:`, e.message);
-        results.push({ number, status: 2, message: e.message });
-        break;
-      }
-    }
-
-    await delay(CONFIG.MESSAGE_DELAY);
-  }
-
-  return results;
-};
-
-
-createClient();
-client.initialize();
-
-module.exports = { sendMessage };
+module.exports = { WhatsAppManager, normalizePhone };
