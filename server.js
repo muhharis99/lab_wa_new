@@ -48,6 +48,7 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/status', (req, res) => {
+  res.set('Cache-Control', 'no-store');
   res.json({ success: true, ...whatsapp.getStatus() });
 });
 
@@ -63,51 +64,51 @@ app.get('/qr', (req, res) => {
   });
 });
 
+app.get('/', (req, res) => {
+  const status = whatsapp.getStatus();
+  const label = status.ready ? 'WhatsApp Terhubung' : status.qr ? 'Scan QR WhatsApp' : 'Menyiapkan WhatsApp';
+  const qr = status.qr
+    ? `<pre style="white-space:pre-wrap;word-break:break-all;background:#fff;color:#111;padding:12px;border-radius:8px">${String(status.qr).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>`
+    : '';
+  res.send(`<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WhatsApp Gateway</title></head><body><main style="font-family:Arial;max-width:720px;margin:40px auto;padding:24px"><h1>WhatsApp Gateway</h1><p>Status: <strong>${label}</strong></p>${qr}<p>Endpoint: <code>POST /send</code></p></main></body></html>`);
+});
+
 app.post('/send', async (req, res) => {
-  try {
-    const { numbers, message } = req.body || {};
-    if (typeof numbers !== 'string' || typeof message !== 'string' || !numbers.trim() || !message.trim()) {
-      return res.status(400).json({ success: false, message: 'numbers dan message wajib diisi' });
-    }
+  const numbers = String(req.body?.numbers || '').trim();
+  const message = String(req.body?.message || '').trim();
 
-    const noReg = message.substring(0, 7);
-    if (!/^\d{7}$/.test(noReg)) {
-      return res.status(400).json({ success: false, message: 'Format no_reg pada awal message tidak valid' });
-    }
-
-    const caption = message.substring(7).trim();
-    const pdfBaseUrl = process.env.LAB_PDF_BASE_URL || 'http://192.168.0.16/serverx/assets/rme/pdf/172.16.18.18';
-    const pdfUrl = `${pdfBaseUrl.replace(/\/$/, '')}/Hasil-Pemeriksaan-Laboratorium-${noReg}.pdf`;
-    const list = numbers.split(',').map((number) => number.trim()).filter(Boolean);
-
-    whatsapp.assertReady();
-
-    const results = [];
-    for (const phone of list) {
-      try {
-        const result = await whatsapp.sendPdf(phone, pdfUrl, caption);
-        results.push({ success: true, ...result, pdfUrl });
-      } catch (error) {
-        logger.error({ err: error, phone }, 'Legacy /send failed');
-        results.push({ success: false, phone, message: error.message, pdfUrl });
-      }
-      if (list.length > 1 && whatsapp.messageDelay > 0) await new Promise((resolve) => setTimeout(resolve, whatsapp.messageDelay));
-    }
-
-    const failed = results.filter((item) => !item.success).length;
-    return res.status(failed ? 207 : 200).json({
-      success: failed === 0,
-      data: results,
-      no_reg: noReg,
-      pdfUrl,
-    });
-  } catch (error) {
-    logger.error({ err: error }, 'Legacy /send error');
-    return res.status(error.code === 'WHATSAPP_NOT_READY' ? 503 : 400).json({
-      success: false,
-      message: error.message,
-    });
+  if (!numbers || !message) {
+    return res.status(422).json({ success: false, message: 'Nomor dan pesan WhatsApp wajib diisi.' });
   }
+
+  const list = numbers.split(',').map((value) => value.trim()).filter(Boolean);
+
+  try {
+    whatsapp.assertReady();
+  } catch (error) {
+    return res.status(503).json({ success: false, message: error.message, state: whatsapp.getStatus().state });
+  }
+
+  const results = [];
+  for (const phone of list) {
+    try {
+      const result = await whatsapp.sendText(phone, message);
+      results.push({ success: true, ...result });
+    } catch (error) {
+      logger.error({ err: error, phone }, 'WhatsApp /send failed');
+      results.push({ success: false, phone, message: error.message || String(error) });
+    }
+    if (list.length > 1 && whatsapp.messageDelay > 0) {
+      await new Promise((resolve) => setTimeout(resolve, whatsapp.messageDelay));
+    }
+  }
+
+  const failed = results.filter((item) => !item.success).length;
+
+  return res.status(failed ? 207 : 200).json({
+    success: failed === 0,
+    data: results,
+  });
 });
 
 app.post('/send-message', requireApiKey, async (req, res) => {
@@ -136,20 +137,17 @@ app.post('/send-bulk', requireApiKey, async (req, res) => {
     return res.status(failed ? 207 : 200).json({ success: failed === 0, data: results });
   } catch (error) {
     logger.error({ err: error }, 'send-bulk failed');
-    return res.status(error.code === 'WHATSAPP_NOT_READY' ? 503 : 400).json({
-      success: false,
-      message: error.message,
-    });
+    return res.status(error.code === 'WHATSAPP_NOT_READY' ? 503 : 400).json({ success: false, message: error.message });
   }
 });
 
 app.post('/logout', requireApiKey, async (req, res) => {
   try {
     await whatsapp.logout();
-    res.json({ success: true, message: 'WhatsApp logged out' });
+    return res.json({ success: true, message: 'WhatsApp logged out' });
   } catch (error) {
     logger.error({ err: error }, 'logout failed');
-    res.status(500).json({ success: false, message: error.message });
+    return res.status(500).json({ success: false, message: error.message });
   }
 });
 
