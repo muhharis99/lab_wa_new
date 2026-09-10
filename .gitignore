@@ -1,0 +1,7 @@
+node_modules/
+.env
+tokens/
+logs/
+*.log
+qr_code.png
+.wwebjs_auth/
