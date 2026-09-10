@@ -1,7 +1,10 @@
 node_modules/
 .env
+.wwebjs_auth/
+.wwebjs_cache/
 tokens/
 logs/
 *.log
 qr_code.png
-.wwebjs_auth/
+credential*
+*credential*
