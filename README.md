@@ -17,7 +17,7 @@ npm install
 cp .env.example .env
 ```
 
-Set a real `API_KEY` in `.env` before exposing the API outside localhost.
+Keep the existing gateway network settings in `.env`, especially `PORT=9000` and `HOST=0.0.0.0`.
 
 ## Run
 
@@ -40,6 +40,33 @@ Returns the current gateway state.
 ### GET /qr
 
 Returns whether a QR login is currently required. The QR is also rendered in the terminal.
+
+### POST /send
+
+This endpoint is kept compatible with the existing laboratory JavaScript client. It accepts the same payload format used by the old gateway:
+
+```json
+{
+  "numbers": "081234567890",
+  "message": "1234567Assalamualaikum..."
+}
+```
+
+The first 7 digits of `message` are treated as `no_reg`. The gateway then downloads the laboratory PDF from `LAB_PDF_BASE_URL` using the filename `Hasil-Pemeriksaan-Laboratorium-{no_reg}.pdf` and sends that PDF with the remaining message as the caption.
+
+Default PDF source:
+
+```text
+http://192.168.0.16/serverx/assets/rme/pdf/172.16.18.18
+```
+
+The laboratory JavaScript can therefore continue calling:
+
+```text
+http://192.168.0.93:9000/send
+```
+
+without opening `wa.me` when the gateway is ready and the PDF is available.
 
 ### POST /send-message
 
@@ -78,12 +105,16 @@ Logs out the currently connected WhatsApp account, clears the LocalAuth session,
 ## Architecture
 
 ```text
+Existing Lab JavaScript
+        ↓
+POST http://192.168.0.93:9000/send
+        ↓
 Express API
-    ↓
+        ↓
 WhatsAppManager
-    ↓
+        ↓
 Single whatsapp-web.js Client
-    ↓
+        ↓
 WhatsApp Web
 ```
 
