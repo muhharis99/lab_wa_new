@@ -6,42 +6,41 @@ const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function normalizePhone(input) {
-  if (typeof input !== 'string') throw new Error('Nomor WhatsApp harus berupa string');
-  let value = input.trim().replace(/\D/g, '');
-  if (value.startsWith('0')) value = `62${value.slice(1)}`;
-  else if (value.startsWith('8')) value = `62${value}`;
-  if (!/^62\d{8,14}$/.test(value)) throw new Error('Format nomor WhatsApp tidak valid');
-  return value;
+function normalizePhone(value) {
+  let phone = String(value || '').replace(/\D+/g, '');
+  if (phone.startsWith('0')) phone = '62' + phone.slice(1);
+  return phone;
+}
+
+function isValidIndonesianPhone(value) {
+  return /^62\d{8,15}$/.test(normalizePhone(value));
 }
 
 class WhatsAppManager {
   constructor({ logger = P({ level: process.env.LOG_LEVEL || 'info' }) } = {}) {
     this.logger = logger;
     this.client = null;
-    this.state = 'DISCONNECTED';
+    this.state = 'STARTING';
     this.qr = null;
-    this.authenticated = false;
-    this.connected = false;
-    this.ready = false;
+    this.lastError = null;
     this.starting = null;
     this.reconnectTimer = null;
     this.reconnectAttempt = 0;
     this.stopped = false;
     this.sessionPath = path.resolve(process.env.WHATSAPP_SESSION_PATH || './tokens/session01');
-    this.maxReconnectDelay = Number(process.env.MAX_RECONNECT_DELAY_MS || 30000);
     this.messageDelay = Number(process.env.MESSAGE_DELAY_MS || 1500);
-    this.readyTimeout = Number(process.env.READY_TIMEOUT_MS || 60000);
-    this.eventBound = false;
+    this.maxReconnectDelay = Number(process.env.MAX_RECONNECT_DELAY_MS || 30000);
   }
 
   getStatus() {
+    const ready = this.state === 'READY' && Boolean(this.client);
     return {
       state: this.state,
-      connected: this.connected,
-      ready: this.ready,
-      authenticated: this.authenticated,
+      ready,
+      connected: ready,
+      authenticated: ['AUTHENTICATED', 'READY'].includes(this.state),
       qr: this.qr,
+      lastError: this.lastError,
       reconnectAttempt: this.reconnectAttempt,
     };
   }
@@ -59,20 +58,24 @@ class WhatsAppManager {
 
   async initialize() {
     if (this.client) {
-      if (this.ready || this.state === 'CONNECTING' || this.state === 'AUTHENTICATED' || this.state === 'QR_REQUIRED') return;
+      const status = this.getStatus();
+      if (status.ready || ['CONNECTING', 'AUTHENTICATED', 'QR_REQUIRED'].includes(this.state)) return;
       try { await this.client.destroy(); } catch {}
       this.client = null;
     }
 
     this.state = 'CONNECTING';
     this.qr = null;
-    this.connected = false;
-    this.ready = false;
+    this.lastError = null;
     this.logger.info('WhatsApp connecting');
 
     fs.mkdirSync(this.sessionPath, { recursive: true });
+
     const client = new Client({
-      authStrategy: new LocalAuth({ dataPath: this.sessionPath }),
+      authStrategy: new LocalAuth({
+        clientId: process.env.WHATSAPP_CLIENT_ID || 'lab-wa-gateway',
+        dataPath: this.sessionPath,
+      }),
       puppeteer: {
         headless: true,
         args: [
@@ -80,8 +83,18 @@ class WhatsAppManager {
           '--disable-setuid-sandbox',
           '--disable-dev-shm-usage',
           '--disable-gpu',
+          '--disable-extensions',
+          '--disable-background-networking',
+          '--disable-background-timer-throttling',
+          '--disable-backgrounding-occluded-windows',
+          '--disable-renderer-backgrounding',
+          '--disable-default-apps',
+          '--disable-sync',
+          '--disable-translate',
+          '--metrics-recording-only',
+          '--mute-audio',
           '--no-first-run',
-          '--no-zygote',
+          '--no-default-browser-check',
         ],
       },
       takeoverOnConflict: true,
@@ -90,20 +103,25 @@ class WhatsAppManager {
 
     this.client = client;
     this.bindEvents(client);
-    await client.initialize();
+
+    try {
+      await client.initialize();
+    } catch (error) {
+      if (this.client === client) {
+        this.client = null;
+        this.state = 'ERROR';
+        this.lastError = error.message || String(error);
+      }
+      throw error;
+    }
   }
 
   bindEvents(client) {
-    if (this.eventBound) this.eventBound = false;
-    this.eventBound = true;
-
     client.on('qr', (qr) => {
       if (this.client !== client) return;
       this.qr = qr;
-      this.authenticated = false;
-      this.connected = false;
-      this.ready = false;
       this.state = 'QR_REQUIRED';
+      this.lastError = null;
       this.logger.info('WhatsApp QR generated');
       qrcode.generate(qr, { small: true });
     });
@@ -111,40 +129,36 @@ class WhatsAppManager {
     client.on('authenticated', () => {
       if (this.client !== client) return;
       this.qr = null;
-      this.authenticated = true;
       this.state = 'AUTHENTICATED';
+      this.lastError = null;
       this.logger.info('WhatsApp authenticated');
     });
 
     client.on('ready', () => {
       if (this.client !== client) return;
       this.qr = null;
-      this.authenticated = true;
-      this.connected = true;
-      this.ready = true;
       this.state = 'READY';
+      this.lastError = null;
       this.reconnectAttempt = 0;
-      this.logger.info('WhatsApp CONNECTED & READY');
+      this.logger.info('WhatsApp gateway READY');
     });
 
     client.on('auth_failure', (message) => {
       if (this.client !== client) return;
-      this.authenticated = false;
-      this.connected = false;
-      this.ready = false;
-      this.state = 'ERROR';
-      this.logger.error({ message }, 'WhatsApp authentication failure');
+      this.state = 'AUTH_FAILURE';
+      this.qr = null;
+      this.lastError = String(message || 'Authentication failure');
+      this.logger.error({ message }, 'WhatsApp auth failure');
     });
 
     client.on('disconnected', (reason) => {
       if (this.client !== client) return;
-      this.connected = false;
-      this.ready = false;
-      this.state = reason === 'LOGOUT' ? 'LOGGED_OUT' : 'RECONNECTING';
-      this.logger.warn({ reason }, 'WhatsApp disconnected');
       this.client = null;
-      if (reason === 'LOGOUT' || this.stopped) return;
-      this.scheduleReconnect();
+      this.qr = null;
+      this.state = reason === 'LOGOUT' ? 'LOGGED_OUT' : 'RECONNECTING';
+      this.lastError = String(reason || 'Disconnected');
+      this.logger.warn({ reason }, 'WhatsApp disconnected');
+      if (reason !== 'LOGOUT' && !this.stopped) this.scheduleReconnect();
     });
   }
 
@@ -158,6 +172,7 @@ class WhatsAppManager {
       try {
         await this.start();
       } catch (error) {
+        this.lastError = error.message || String(error);
         this.logger.error({ err: error }, 'WhatsApp reconnect failed');
         this.scheduleReconnect();
       }
@@ -166,8 +181,8 @@ class WhatsAppManager {
   }
 
   assertReady() {
-    if (!this.client || !this.connected || !this.ready || this.state !== 'READY') {
-      const error = new Error('WhatsApp is not ready');
+    if (!this.client || this.state !== 'READY') {
+      const error = new Error('WhatsApp belum terhubung. Scan QR terlebih dahulu.');
       error.code = 'WHATSAPP_NOT_READY';
       throw error;
     }
@@ -175,36 +190,47 @@ class WhatsAppManager {
 
   async sendText(phone, message) {
     const normalized = normalizePhone(phone);
-    if (typeof message !== 'string' || !message.trim()) throw new Error('Message wajib diisi');
+    if (!isValidIndonesianPhone(normalized)) throw new Error('Format nomor WhatsApp tidak valid.');
+    if (typeof message !== 'string' || !message.trim()) throw new Error('Pesan WhatsApp kosong.');
     this.assertReady();
-    const chatId = `${normalized}@c.us`;
-    const sent = await this.client.sendMessage(chatId, message, { sendSeen: false });
-    return { phone: normalized, messageId: sent?.id?.id || null };
+
+    const numberId = await this.client.getNumberId(normalized);
+    if (!numberId) throw new Error('Nomor tidak terdaftar di WhatsApp.');
+
+    const sent = await this.client.sendMessage(numberId._serialized, message, { sendSeen: false });
+    this.logger.info({ phone: normalized, messageId: sent?.id?._serialized || null }, 'WhatsApp message sent');
+    return { phone: normalized, messageId: sent?.id?._serialized || null };
   }
 
   async sendPdf(phone, pdfUrl, caption = '') {
     const normalized = normalizePhone(phone);
+    if (!isValidIndonesianPhone(normalized)) throw new Error('Format nomor WhatsApp tidak valid.');
     this.assertReady();
+
     const response = await fetch(pdfUrl);
     if (!response.ok) throw new Error(`Gagal mengambil PDF: HTTP ${response.status}`);
     const buffer = Buffer.from(await response.arrayBuffer());
     if (buffer.length > 16 * 1024 * 1024) throw new Error('PDF lebih dari 16MB');
-    const media = new MessageMedia('application/pdf', buffer.toString('base64'), 'Hasil-Lab.pdf');
-    const sent = await this.client.sendMessage(`${normalized}@c.us`, media, { caption, sendSeen: false });
-    return { phone: normalized, messageId: sent?.id?.id || null };
+
+    const numberId = await this.client.getNumberId(normalized);
+    if (!numberId) throw new Error('Nomor tidak terdaftar di WhatsApp.');
+
+    const media = new MessageMedia('application/pdf', buffer.toString('base64'), 'Hasil-Pemeriksaan-Laboratorium.pdf');
+    const sent = await this.client.sendMessage(numberId._serialized, media, { caption, sendSeen: false });
+    this.logger.info({ phone: normalized, messageId: sent?.id?._serialized || null }, 'WhatsApp PDF sent');
+    return { phone: normalized, messageId: sent?.id?._serialized || null };
   }
 
   async sendBulk(numbers, message, delayMs = this.messageDelay) {
-    this.assertReady();
     if (!Array.isArray(numbers) || numbers.length === 0) throw new Error('numbers harus array dan tidak boleh kosong');
-    const list = [...new Set(numbers.map((number) => normalizePhone(String(number))))];
+    this.assertReady();
     const results = [];
-    for (const phone of list) {
+    for (const rawNumber of [...new Set(numbers.map((value) => normalizePhone(String(value))))]) {
       try {
-        results.push({ success: true, ...(await this.sendText(phone, message)) });
+        results.push({ success: true, ...(await this.sendText(rawNumber, message)) });
       } catch (error) {
-        results.push({ success: false, phone, message: error.message });
-        this.logger.error({ err: error, phone }, 'WhatsApp message failed');
+        results.push({ success: false, phone: rawNumber, message: error.message || String(error) });
+        this.logger.error({ err: error, phone: rawNumber }, 'WhatsApp message failed');
       }
       if (delayMs > 0) await delay(delayMs);
     }
@@ -217,17 +243,18 @@ class WhatsAppManager {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+
     const client = this.client;
     this.client = null;
-    this.connected = false;
-    this.ready = false;
-    this.authenticated = false;
-    this.qr = null;
     this.state = 'LOGGED_OUT';
+    this.qr = null;
+    this.lastError = null;
+
     if (client) {
       try { await client.logout(); } catch (error) { this.logger.warn({ err: error }, 'WhatsApp logout returned an error'); }
       try { await client.destroy(); } catch {}
     }
+
     await delay(300);
     try {
       if (fs.existsSync(this.sessionPath)) fs.rmSync(this.sessionPath, { recursive: true, force: true });
