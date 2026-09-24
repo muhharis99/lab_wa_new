@@ -89,6 +89,8 @@ class WhatsAppManager {
     this.maxReconnectDelay = Number(process.env.MAX_RECONNECT_DELAY_MS || 30000);
     this.chromiumLockRetryCount = Number(process.env.CHROMIUM_LOCK_RETRY_COUNT || 1);
     this.initializeTimeoutMs = Number(process.env.WHATSAPP_INIT_TIMEOUT_MS || 120000);
+    this.readyProbePromise = null;
+    this.readyProbeTimeoutMs = Number(process.env.WHATSAPP_READY_PROBE_TIMEOUT_MS || 15000);
   }
 
   getStatus() {
@@ -238,6 +240,7 @@ class WhatsAppManager {
       this.state = 'AUTHENTICATED';
       this.lastError = null;
       this.logger.info('WhatsApp authenticated');
+      void this.probeReady(client);
     });
 
     client.on('ready', () => {
@@ -284,6 +287,77 @@ class WhatsAppManager {
       }
     }, delayMs);
     this.logger.info({ delayMs, attempt: this.reconnectAttempt }, 'WhatsApp reconnect scheduled');
+  }
+
+  async probeReady(client, timeoutMs = this.readyProbeTimeoutMs) {
+    if (this.client !== client) return false;
+    if (this.state === 'READY') return true;
+    if (this.readyProbePromise) return this.readyProbePromise;
+
+    this.readyProbePromise = (async () => {
+      const deadline = Date.now() + timeoutMs;
+
+      while (this.client === client && Date.now() < deadline) {
+        try {
+          const pageReady = await client.pupPage?.evaluate(() => {
+            const hasWWebJS = typeof window.WWebJS !== 'undefined';
+            let hasCollections = false;
+
+            try {
+              hasCollections = Boolean(
+                window.require &&
+                window.require('WAWebCollections') &&
+                window.require('WAWebCollections').Msg
+              );
+            } catch (_) {}
+
+            let socket = null;
+            try {
+              const socketModel = window.require('WAWebSocketModel');
+              const s = socketModel?.Socket;
+              socket = {
+                state: s?.state ?? null,
+                stream: s?.stream ?? null,
+                wsReadyState: s?.socket?.readyState ?? null,
+                hasSynced: s?.hasSynced ?? null,
+              };
+            } catch (_) {}
+
+            return { hasWWebJS, hasCollections, socket };
+          });
+
+          const connectedEnough =
+            pageReady?.hasWWebJS &&
+            pageReady?.hasCollections &&
+            pageReady?.socket?.state &&
+            pageReady.socket.state !== 'OPENING' &&
+            pageReady.socket.stream !== 'DISCONNECTED' &&
+            pageReady.socket.wsReadyState !== null &&
+            pageReady.socket.wsReadyState !== 0;
+
+          if (connectedEnough) {
+            this.qr = null;
+            this.state = 'READY';
+            this.lastError = null;
+            this.reconnectAttempt = 0;
+            this.logger.info({ socket: pageReady.socket }, 'WhatsApp gateway READY (page probe)');
+            return true;
+          }
+        } catch (error) {
+          this.logger.debug({ err: error }, 'WhatsApp ready probe pending');
+        }
+
+        await delay(250);
+      }
+
+      return this.client === client && this.state === 'READY';
+    })();
+
+    try {
+      return await this.readyProbePromise;
+    } finally {
+      this.readyProbePromise = null;
+    }
   }
 
   assertReady() {
