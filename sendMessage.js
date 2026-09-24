@@ -50,8 +50,8 @@ function terminateChromiumUsingProfile(userDataDir, logger) {
   const normalizedProfile = path.resolve(userDataDir).replace(/\\/g, '\\\\');
   const command = [
     '$profile = [IO.Path]::GetFullPath(\'' + normalizedProfile.replace(/'/g, "''") + '\');',
-    '$procs = Get-CimInstance Win32_Process -Filter "Name = \'chrome.exe\' OR Name = \'chrome.exe\'";',
-    '$procs | Where-Object { $_.CommandLine -and $_.CommandLine -like (\'*--user-data-dir=*\' + $profile + \'*\') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Output $_.ProcessId }'
+    '$procs = Get-CimInstance Win32_Process | Where-Object { $_.Name -in @("chrome.exe","chromium.exe","msedge.exe") -and $_.CommandLine -and $_.CommandLine -like ("*" + $profile + "*") };',
+    '$procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Output $_.ProcessId }'
   ].join(' ');
 
   return new Promise((resolve) => {
@@ -60,7 +60,7 @@ function terminateChromiumUsingProfile(userDataDir, logger) {
       ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command],
       { windowsHide: true, timeout: 10000 },
       (error, stdout) => {
-        if (error && error.code !== 1) {
+        if (error) {
           logger.warn({ err: error, userDataDir }, 'Could not inspect/terminate Chromium profile process');
         }
         const pids = String(stdout || '').trim();
