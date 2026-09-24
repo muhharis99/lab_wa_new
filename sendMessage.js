@@ -91,6 +91,8 @@ class WhatsAppManager {
     this.initializeTimeoutMs = Number(process.env.WHATSAPP_INIT_TIMEOUT_MS || 120000);
     this.readyProbePromise = null;
     this.readyProbeTimeoutMs = Number(process.env.WHATSAPP_READY_PROBE_TIMEOUT_MS || 15000);
+    this.socketHealthyCheckTimeoutMs = Number(process.env.WHATSAPP_SOCKET_CHECK_TIMEOUT_MS || 5000);
+    this.restarting = null;
   }
 
   getStatus() {
@@ -326,12 +328,17 @@ class WhatsAppManager {
             return { hasWWebJS, hasCollections, socket };
           });
 
+          const socketOpen =
+            pageReady?.socket?.wsReadyState === 1 ||
+            pageReady?.socket?.wsReadyState === null;
+
           const connectedEnough =
             pageReady?.hasWWebJS &&
             pageReady?.hasCollections &&
             pageReady?.socket &&
             pageReady.socket.state !== 'OPENING' &&
-            pageReady.socket.stream !== 'DISCONNECTED';
+            pageReady.socket.stream !== 'DISCONNECTED' &&
+            socketOpen;
 
           if (connectedEnough) {
             this.qr = null;
@@ -358,9 +365,123 @@ class WhatsAppManager {
     }
   }
 
-  assertReady() {
+  async getSocketHealth(client = this.client) {
+    if (!client?.pupPage) {
+      return { healthy: false, reason: 'NO_PAGE', state: null, stream: null, wsReadyState: null };
+    }
+
+    try {
+      const info = await Promise.race([
+        client.pupPage.evaluate(() => {
+          try {
+            const socketModel = window.require('WAWebSocketModel');
+            const socket = socketModel?.Socket;
+            const ws = socket?.socket;
+
+            return {
+              state: socket?.state ?? null,
+              stream: socket?.stream ?? null,
+              wsReadyState: ws?.readyState ?? null,
+              hasSynced: socket?.hasSynced ?? null,
+            };
+          } catch (error) {
+            return {
+              state: null,
+              stream: null,
+              wsReadyState: null,
+              hasSynced: null,
+              error: String(error?.message || error),
+            };
+          }
+        }),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Socket health check timeout')), this.socketHealthyCheckTimeoutMs)
+        ),
+      ]);
+
+      const healthy =
+        info?.state === 'CONNECTED' &&
+        info?.stream !== 'DISCONNECTED' &&
+        (info?.wsReadyState === 1 || info?.wsReadyState === null);
+
+      return { ...info, healthy };
+    } catch (error) {
+      return {
+        healthy: false,
+        reason: error.message || String(error),
+        state: null,
+        stream: null,
+        wsReadyState: null,
+      };
+    }
+  }
+
+  async restartClient(reason = 'unhealthy WhatsApp socket') {
+    if (this.restarting) return this.restarting;
+
+    this.restarting = (async () => {
+      this.logger.warn({ reason }, 'Restarting WhatsApp client');
+      this.stopped = false;
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+
+      const oldClient = this.client;
+      this.client = null;
+      this.qr = null;
+      this.state = 'RECONNECTING';
+
+      if (oldClient) {
+        try { await oldClient.destroy(); } catch (error) {
+          this.logger.warn({ err: error }, 'Could not destroy unhealthy WhatsApp client');
+        }
+      }
+
+      await terminateChromiumUsingProfile(this.browserProfilePath, this.logger);
+      removeStaleChromiumLocks(this.browserProfilePath, this.logger);
+      await delay(500);
+
+      try {
+        await this.start();
+        return this.client;
+      } catch (error) {
+        this.logger.error({ err: error }, 'WhatsApp restart failed');
+        throw error;
+      }
+    })();
+
+    try {
+      return await this.restarting;
+    } finally {
+      this.restarting = null;
+    }
+  }
+
+  async ensureSocketHealthy() {
+    if (!this.client) {
+      await this.start();
+      return;
+    }
+
+    const health = await this.getSocketHealth(this.client);
+    if (health.healthy) {
+      if (this.state !== 'READY') {
+        this.state = 'READY';
+        this.logger.info({ health }, 'WhatsApp gateway READY (socket healthy)');
+      }
+      return;
+    }
+
+    this.logger.warn({ health }, 'WhatsApp socket is not healthy; reconnecting before send');
+    await this.restartClient('socket health check failed');
+  }
+
+  async assertReady() {
+    await this.ensureSocketHealthy();
+
     if (!this.client || this.state !== 'READY') {
-      const error = new Error('WhatsApp belum terhubung. Scan QR terlebih dahulu.');
+      const error = new Error('WhatsApp belum siap mengirim.');
       error.code = 'WHATSAPP_NOT_READY';
       throw error;
     }
@@ -370,7 +491,7 @@ class WhatsAppManager {
     const normalized = normalizePhone(phone);
     if (!isValidIndonesianPhone(normalized)) throw new Error('Format nomor WhatsApp tidak valid.');
     if (typeof message !== 'string' || !message.trim()) throw new Error('Pesan WhatsApp kosong.');
-    this.assertReady();
+    await this.assertReady();
 
     const numberId = await this.client.getNumberId(normalized);
     if (!numberId) throw new Error('Nomor tidak terdaftar di WhatsApp.');
@@ -383,7 +504,7 @@ class WhatsAppManager {
   async sendPdf(phone, pdfUrl, caption = '') {
     const normalized = normalizePhone(phone);
     if (!isValidIndonesianPhone(normalized)) throw new Error('Format nomor WhatsApp tidak valid.');
-    this.assertReady();
+    await this.assertReady();
 
     const response = await fetch(pdfUrl);
     if (!response.ok) throw new Error(`Gagal mengambil PDF: HTTP ${response.status}`);
@@ -401,7 +522,7 @@ class WhatsAppManager {
 
   async sendBulk(numbers, message, delayMs = this.messageDelay) {
     if (!Array.isArray(numbers) || numbers.length === 0) throw new Error('numbers harus array dan tidak boleh kosong');
-    this.assertReady();
+    await this.assertReady();
     const results = [];
     for (const rawNumber of [...new Set(numbers.map((value) => normalizePhone(String(value))))]) {
       try {
