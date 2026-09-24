@@ -328,9 +328,7 @@ class WhatsAppManager {
             return { hasWWebJS, hasCollections, socket };
           });
 
-          const socketOpen =
-            pageReady?.socket?.wsReadyState === 1 ||
-            pageReady?.socket?.wsReadyState === null;
+          const socketOpen = pageReady?.socket?.wsReadyState === 1;
 
           const connectedEnough =
             pageReady?.hasWWebJS &&
@@ -402,7 +400,7 @@ class WhatsAppManager {
       const healthy =
         info?.state === 'CONNECTED' &&
         info?.stream !== 'DISCONNECTED' &&
-        (info?.wsReadyState === 1 || info?.wsReadyState === null);
+        info?.wsReadyState === 1;
 
       return { ...info, healthy };
     } catch (error) {
@@ -459,22 +457,43 @@ class WhatsAppManager {
   }
 
   async ensureSocketHealthy() {
-    if (!this.client) {
-      await this.start();
-      return;
-    }
+    const deadline = Date.now() + this.readyProbeTimeoutMs;
 
-    const health = await this.getSocketHealth(this.client);
-    if (health.healthy) {
-      if (this.state !== 'READY') {
-        this.state = 'READY';
-        this.logger.info({ health }, 'WhatsApp gateway READY (socket healthy)');
+    while (Date.now() < deadline) {
+      if (!this.client) {
+        await this.start();
       }
-      return;
+
+      const health = await this.getSocketHealth(this.client);
+
+      if (health.healthy) {
+        if (this.state !== 'READY') {
+          this.state = 'READY';
+          this.lastError = null;
+          this.reconnectAttempt = 0;
+          this.logger.info({ health }, 'WhatsApp gateway READY (socket healthy)');
+        }
+        return;
+      }
+
+      this.logger.warn({ health }, 'WhatsApp socket is not healthy');
+
+      if (
+        health.reason === 'NO_PAGE' ||
+        health.reason === 'Socket health check timeout' ||
+        health.wsReadyState === null ||
+        health.state !== 'CONNECTED' ||
+        health.stream === 'DISCONNECTED'
+      ) {
+        await this.restartClient('socket is not OPEN');
+      }
+
+      await delay(500);
     }
 
-    this.logger.warn({ health }, 'WhatsApp socket is not healthy; reconnecting before send');
-    await this.restartClient('socket health check failed');
+    const error = new Error('WhatsApp belum siap mengirim: koneksi WebSocket belum OPEN.');
+    error.code = 'WHATSAPP_NOT_READY';
+    throw error;
   }
 
   async assertReady() {
