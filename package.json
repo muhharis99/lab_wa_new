@@ -21,6 +21,6 @@
     "pino": "^9.13.1",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "github:Adi1231234/whatsapp-web.js#85443fa4c8f86111457590dd06564c3efe0f6d1d"
+    "whatsapp-web.js": "^1.34.7"
   }
 }
