@@ -1,5 +1,6 @@
 const path = require('path');
 const fs = require('fs');
+const { execFile } = require('child_process');
 const qrcode = require('qrcode-terminal');
 const P = require('pino');
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
@@ -43,6 +44,33 @@ function removeStaleChromiumLocks(userDataDir, logger) {
   }
 }
 
+function terminateChromiumUsingProfile(userDataDir, logger) {
+  if (process.platform !== 'win32' || !userDataDir) return Promise.resolve();
+
+  const normalizedProfile = path.resolve(userDataDir).replace(/\\/g, '\\\\');
+  const command = [
+    '$profile = [IO.Path]::GetFullPath(\'' + normalizedProfile.replace(/'/g, "''") + '\');',
+    '$procs = Get-CimInstance Win32_Process -Filter "Name = \'chrome.exe\' OR Name = \'chrome.exe\'";',
+    '$procs | Where-Object { $_.CommandLine -and $_.CommandLine -like (\'*--user-data-dir=*\' + $profile + \'*\') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Output $_.ProcessId }'
+  ].join(' ');
+
+  return new Promise((resolve) => {
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command],
+      { windowsHide: true, timeout: 10000 },
+      (error, stdout) => {
+        if (error && error.code !== 1) {
+          logger.warn({ err: error, userDataDir }, 'Could not inspect/terminate Chromium profile process');
+        }
+        const pids = String(stdout || '').trim();
+        if (pids) logger.warn({ userDataDir, pids }, 'Terminated Chromium process holding WhatsApp profile');
+        resolve();
+      }
+    );
+  });
+}
+
 class WhatsAppManager {
   constructor({ logger = P({ level: process.env.LOG_LEVEL || 'info' }) } = {}) {
     this.logger = logger;
@@ -55,6 +83,8 @@ class WhatsAppManager {
     this.reconnectAttempt = 0;
     this.stopped = false;
     this.sessionPath = path.resolve(process.env.WHATSAPP_SESSION_PATH || './tokens/session01');
+    this.clientId = process.env.WHATSAPP_CLIENT_ID || 'lab-wa-gateway';
+    this.browserProfilePath = path.join(this.sessionPath, `session-${this.clientId}`);
     this.messageDelay = Number(process.env.MESSAGE_DELAY_MS || 1500);
     this.maxReconnectDelay = Number(process.env.MAX_RECONNECT_DELAY_MS || 30000);
     this.chromiumLockRetryCount = Number(process.env.CHROMIUM_LOCK_RETRY_COUNT || 1);
@@ -102,7 +132,7 @@ class WhatsAppManager {
 
     const client = new Client({
       authStrategy: new LocalAuth({
-        clientId: process.env.WHATSAPP_CLIENT_ID || 'lab-wa-gateway',
+        clientId: this.clientId,
         dataPath: this.sessionPath,
       }),
       puppeteer: {
@@ -161,10 +191,12 @@ class WhatsAppManager {
           'Chromium profile appears locked; cleaning stale lock files and retrying'
         );
 
-        // Do not delete the WhatsApp auth/session data. Only remove Chromium's
-        // lock marker files, then retry client.initialize().
-        removeStaleChromiumLocks(this.sessionPath, this.logger);
-        await delay(500);
+        // LocalAuth uses session-<clientId> as Puppeteer's actual userDataDir.
+        // Clean that profile, not the parent session directory.
+        try { await client.destroy(); } catch {}
+        await terminateChromiumUsingProfile(this.browserProfilePath, this.logger);
+        removeStaleChromiumLocks(this.browserProfilePath, this.logger);
+        await delay(700);
       }
     }
 
@@ -178,6 +210,7 @@ class WhatsAppManager {
       } catch (destroyError) {
         this.logger.warn({ err: destroyError }, 'Could not destroy failed WhatsApp client');
       }
+      await terminateChromiumUsingProfile(this.browserProfilePath, this.logger);
 
       if (this.client === client) {
         this.client = null;
