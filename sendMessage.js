@@ -329,11 +329,9 @@ class WhatsAppManager {
           const connectedEnough =
             pageReady?.hasWWebJS &&
             pageReady?.hasCollections &&
-            pageReady?.socket?.state &&
+            pageReady?.socket &&
             pageReady.socket.state !== 'OPENING' &&
-            pageReady.socket.stream !== 'DISCONNECTED' &&
-            pageReady.socket.wsReadyState !== null &&
-            pageReady.socket.wsReadyState !== 0;
+            pageReady.socket.stream !== 'DISCONNECTED';
 
           if (connectedEnough) {
             this.qr = null;
