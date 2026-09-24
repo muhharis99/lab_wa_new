@@ -7,8 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "check": "node --check server.js && node --check sendMessage.js",
-    "stop:gateway": "node scripts/stop-gateway.js"
+    "check": "node --check server.js && node --check sendMessage.js"
   },
   "engines": {
     "node": ">=18"
