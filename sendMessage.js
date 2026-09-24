@@ -169,6 +169,16 @@ class WhatsAppManager {
     }
 
     if (!initialized) {
+      // Important: client.initialize() may have started Chromium before failing.
+      // Always destroy that client here, otherwise its Chrome process can keep
+      // session-lab-wa-gateway locked and every reconnect will fail with
+      // "The browser is already running".
+      try {
+        await client.destroy();
+      } catch (destroyError) {
+        this.logger.warn({ err: destroyError }, 'Could not destroy failed WhatsApp client');
+      }
+
       if (this.client === client) {
         this.client = null;
         this.state = 'ERROR';
@@ -298,6 +308,30 @@ class WhatsAppManager {
       if (delayMs > 0) await delay(delayMs);
     }
     return results;
+  }
+
+  async close() {
+    this.stopped = true;
+
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    const client = this.client;
+    this.client = null;
+
+    if (client) {
+      try {
+        await client.destroy();
+      } catch (error) {
+        this.logger.warn({ err: error }, 'WhatsApp client close returned an error');
+      }
+    }
+
+    this.state = 'STOPPED';
+    this.qr = null;
+    this.lastError = null;
   }
 
   async logout() {
