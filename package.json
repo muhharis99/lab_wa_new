@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "check": "node --check server.js && node --check sendMessage.js"
+    "check": "node --check server.js && node --check sendMessage.js",
+    "prestart": "node scripts/patch-whatsapp-web.js"
   },
   "engines": {
     "node": ">=18"
@@ -21,4 +22,4 @@
     "qrcode-terminal": "^0.12.0",
     "whatsapp-web.js": "^1.34.7"
   }
-}
+}\n
