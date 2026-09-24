@@ -87,7 +87,7 @@ app.post('/send', async (req, res) => {
   }
 
   const failed = results.filter((item) => !item.success).length;
-  return res.status(failed ? 207 : 200).json({ success: failed === 0, noReg, pdfUrl, data: results });
+  return res.status(failed ? 500 : 200).json({ success: failed === 0, noReg, pdfUrl, data: results });
 });
 
 app.post('/send-message', requireApiKey, async (req, res) => {
