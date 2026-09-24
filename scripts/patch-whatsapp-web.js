@@ -15,8 +15,13 @@ const marker = 'delete message.__x_id;';
 const anchor = '        // Bot\'s won\'t reply if canonicalUrl is set (linking)';
 
 if (!fs.existsSync(target)) {
-  console.log('[WA PATCH] whatsapp-web.js source not found; skipping.');
-  process.exit(0);
+  const moduleDir = path.join(process.cwd(), 'node_modules', 'whatsapp-web.js');
+  if (!fs.existsSync(moduleDir)) {
+    console.error('[WA PATCH] whatsapp-web.js is not installed. Run: npm install');
+  } else {
+    console.error('[WA PATCH] Could not locate whatsapp-web.js Injected/Utils.js');
+  }
+  process.exit(1);
 }
 
 let source = fs.readFileSync(target, 'utf8');
