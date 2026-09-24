@@ -89,8 +89,6 @@ class WhatsAppManager {
     this.maxReconnectDelay = Number(process.env.MAX_RECONNECT_DELAY_MS || 30000);
     this.chromiumLockRetryCount = Number(process.env.CHROMIUM_LOCK_RETRY_COUNT || 1);
     this.initializeTimeoutMs = Number(process.env.WHATSAPP_INIT_TIMEOUT_MS || 120000);
-    this.readyCheckPromise = null;
-    this.readyCheckTimeoutMs = Number(process.env.WHATSAPP_READY_CHECK_TIMEOUT_MS || 30000);
   }
 
   getStatus() {
@@ -240,10 +238,6 @@ class WhatsAppManager {
       this.state = 'AUTHENTICATED';
       this.lastError = null;
       this.logger.info('WhatsApp authenticated');
-
-      // Some WhatsApp Web builds emit authenticated but miss the public
-      // ready event. Resolve readiness from the actual Client state instead.
-      void this.waitForConnected(client);
     });
 
     client.on('ready', () => {
@@ -292,70 +286,19 @@ class WhatsAppManager {
     this.logger.info({ delayMs, attempt: this.reconnectAttempt }, 'WhatsApp reconnect scheduled');
   }
 
-  async waitForConnected(client, timeoutMs = this.readyCheckTimeoutMs) {
-    if (this.client !== client) return false;
-    if (this.readyCheckPromise) return this.readyCheckPromise;
-
-    this.readyCheckPromise = (async () => {
-      const deadline = Date.now() + timeoutMs;
-
-      while (this.client === client && Date.now() < deadline) {
-        try {
-          const state = await client.getState();
-
-          if (state === 'CONNECTED') {
-            this.qr = null;
-            this.state = 'READY';
-            this.lastError = null;
-            this.reconnectAttempt = 0;
-            this.logger.info('WhatsApp gateway READY (state=CONNECTED)');
-            return true;
-          }
-
-          if (state === 'CONFLICT') {
-            this.logger.warn('WhatsApp state is CONFLICT; takeover is enabled');
-          } else if (state && state !== 'OPENING') {
-            this.logger.info({ whatsappState: state }, 'Waiting for WhatsApp connection');
-          }
-        } catch (error) {
-          this.logger.warn({ err: error }, 'Could not read WhatsApp connection state yet');
-        }
-
-        await delay(1000);
-      }
-
-      return this.client === client && this.state === 'READY';
-    })();
-
-    try {
-      return await this.readyCheckPromise;
-    } finally {
-      this.readyCheckPromise = null;
-    }
-  }
-
-  async assertReady() {
-    if (!this.client) {
-      const error = new Error('WhatsApp belum terhubung.');
+  assertReady() {
+    if (!this.client || this.state !== 'READY') {
+      const error = new Error('WhatsApp belum terhubung. Scan QR terlebih dahulu.');
       error.code = 'WHATSAPP_NOT_READY';
       throw error;
     }
-
-    if (this.state === 'READY') return;
-
-    const ready = await this.waitForConnected(this.client);
-    if (ready) return;
-
-    const error = new Error('WhatsApp belum siap mengirim. Status koneksi belum CONNECTED.');
-    error.code = 'WHATSAPP_NOT_READY';
-    throw error;
   }
 
   async sendText(phone, message) {
     const normalized = normalizePhone(phone);
     if (!isValidIndonesianPhone(normalized)) throw new Error('Format nomor WhatsApp tidak valid.');
     if (typeof message !== 'string' || !message.trim()) throw new Error('Pesan WhatsApp kosong.');
-    await this.assertReady();
+    this.assertReady();
 
     const numberId = await this.client.getNumberId(normalized);
     if (!numberId) throw new Error('Nomor tidak terdaftar di WhatsApp.');
@@ -368,7 +311,7 @@ class WhatsAppManager {
   async sendPdf(phone, pdfUrl, caption = '') {
     const normalized = normalizePhone(phone);
     if (!isValidIndonesianPhone(normalized)) throw new Error('Format nomor WhatsApp tidak valid.');
-    await this.assertReady();
+    this.assertReady();
 
     const response = await fetch(pdfUrl);
     if (!response.ok) throw new Error(`Gagal mengambil PDF: HTTP ${response.status}`);
@@ -386,7 +329,7 @@ class WhatsAppManager {
 
   async sendBulk(numbers, message, delayMs = this.messageDelay) {
     if (!Array.isArray(numbers) || numbers.length === 0) throw new Error('numbers harus array dan tidak boleh kosong');
-    await this.assertReady();
+    this.assertReady();
     const results = [];
     for (const rawNumber of [...new Set(numbers.map((value) => normalizePhone(String(value))))]) {
       try {
