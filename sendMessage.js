@@ -89,10 +89,6 @@ class WhatsAppManager {
     this.maxReconnectDelay = Number(process.env.MAX_RECONNECT_DELAY_MS || 30000);
     this.chromiumLockRetryCount = Number(process.env.CHROMIUM_LOCK_RETRY_COUNT || 1);
     this.initializeTimeoutMs = Number(process.env.WHATSAPP_INIT_TIMEOUT_MS || 120000);
-    this.readyProbePromise = null;
-    this.readyProbeTimeoutMs = Number(process.env.WHATSAPP_READY_PROBE_TIMEOUT_MS || 15000);
-    this.socketHealthyCheckTimeoutMs = Number(process.env.WHATSAPP_SOCKET_CHECK_TIMEOUT_MS || 5000);
-    this.restarting = null;
   }
 
   getStatus() {
@@ -242,7 +238,6 @@ class WhatsAppManager {
       this.state = 'AUTHENTICATED';
       this.lastError = null;
       this.logger.info('WhatsApp authenticated');
-      void this.probeReady(client);
     });
 
     client.on('ready', () => {
@@ -291,216 +286,9 @@ class WhatsAppManager {
     this.logger.info({ delayMs, attempt: this.reconnectAttempt }, 'WhatsApp reconnect scheduled');
   }
 
-  async probeReady(client, timeoutMs = this.readyProbeTimeoutMs) {
-    if (this.client !== client) return false;
-    if (this.state === 'READY') return true;
-    if (this.readyProbePromise) return this.readyProbePromise;
-
-    this.readyProbePromise = (async () => {
-      const deadline = Date.now() + timeoutMs;
-
-      while (this.client === client && Date.now() < deadline) {
-        try {
-          const pageReady = await client.pupPage?.evaluate(() => {
-            const hasWWebJS = typeof window.WWebJS !== 'undefined';
-            let hasCollections = false;
-
-            try {
-              hasCollections = Boolean(
-                window.require &&
-                window.require('WAWebCollections') &&
-                window.require('WAWebCollections').Msg
-              );
-            } catch (_) {}
-
-            let socket = null;
-            try {
-              const socketModel = window.require('WAWebSocketModel');
-              const s = socketModel?.Socket;
-              socket = {
-                state: s?.state ?? null,
-                stream: s?.stream ?? null,
-                wsReadyState: s?.socket?.readyState ?? null,
-                hasSynced: s?.hasSynced ?? null,
-              };
-            } catch (_) {}
-
-            return { hasWWebJS, hasCollections, socket };
-          });
-
-          const socketOpen = pageReady?.socket?.wsReadyState === 1;
-
-          const connectedEnough =
-            pageReady?.hasWWebJS &&
-            pageReady?.hasCollections &&
-            pageReady?.socket &&
-            pageReady.socket.state !== 'OPENING' &&
-            pageReady.socket.stream !== 'DISCONNECTED' &&
-            socketOpen;
-
-          if (connectedEnough) {
-            this.qr = null;
-            this.state = 'READY';
-            this.lastError = null;
-            this.reconnectAttempt = 0;
-            this.logger.info({ socket: pageReady.socket }, 'WhatsApp gateway READY (page probe)');
-            return true;
-          }
-        } catch (error) {
-          this.logger.debug({ err: error }, 'WhatsApp ready probe pending');
-        }
-
-        await delay(250);
-      }
-
-      return this.client === client && this.state === 'READY';
-    })();
-
-    try {
-      return await this.readyProbePromise;
-    } finally {
-      this.readyProbePromise = null;
-    }
-  }
-
-  async getSocketHealth(client = this.client) {
-    if (!client?.pupPage) {
-      return { healthy: false, reason: 'NO_PAGE', state: null, stream: null, wsReadyState: null };
-    }
-
-    try {
-      const info = await Promise.race([
-        client.pupPage.evaluate(() => {
-          try {
-            const socketModel = window.require('WAWebSocketModel');
-            const socket = socketModel?.Socket;
-            const ws = socket?.socket;
-
-            return {
-              state: socket?.state ?? null,
-              stream: socket?.stream ?? null,
-              wsReadyState: ws?.readyState ?? null,
-              hasSynced: socket?.hasSynced ?? null,
-            };
-          } catch (error) {
-            return {
-              state: null,
-              stream: null,
-              wsReadyState: null,
-              hasSynced: null,
-              error: String(error?.message || error),
-            };
-          }
-        }),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('Socket health check timeout')), this.socketHealthyCheckTimeoutMs)
-        ),
-      ]);
-
-      const healthy =
-        info?.state === 'CONNECTED' &&
-        info?.stream !== 'DISCONNECTED' &&
-        info?.wsReadyState === 1;
-
-      return { ...info, healthy };
-    } catch (error) {
-      return {
-        healthy: false,
-        reason: error.message || String(error),
-        state: null,
-        stream: null,
-        wsReadyState: null,
-      };
-    }
-  }
-
-  async restartClient(reason = 'unhealthy WhatsApp socket') {
-    if (this.restarting) return this.restarting;
-
-    this.restarting = (async () => {
-      this.logger.warn({ reason }, 'Restarting WhatsApp client');
-      this.stopped = false;
-      if (this.reconnectTimer) {
-        clearTimeout(this.reconnectTimer);
-        this.reconnectTimer = null;
-      }
-
-      const oldClient = this.client;
-      this.client = null;
-      this.qr = null;
-      this.state = 'RECONNECTING';
-
-      if (oldClient) {
-        try { await oldClient.destroy(); } catch (error) {
-          this.logger.warn({ err: error }, 'Could not destroy unhealthy WhatsApp client');
-        }
-      }
-
-      await terminateChromiumUsingProfile(this.browserProfilePath, this.logger);
-      removeStaleChromiumLocks(this.browserProfilePath, this.logger);
-      await delay(500);
-
-      try {
-        await this.start();
-        return this.client;
-      } catch (error) {
-        this.logger.error({ err: error }, 'WhatsApp restart failed');
-        throw error;
-      }
-    })();
-
-    try {
-      return await this.restarting;
-    } finally {
-      this.restarting = null;
-    }
-  }
-
-  async ensureSocketHealthy() {
-    const deadline = Date.now() + this.readyProbeTimeoutMs;
-
-    while (Date.now() < deadline) {
-      if (!this.client) {
-        await this.start();
-      }
-
-      const health = await this.getSocketHealth(this.client);
-
-      if (health.healthy) {
-        if (this.state !== 'READY') {
-          this.state = 'READY';
-          this.lastError = null;
-          this.reconnectAttempt = 0;
-          this.logger.info({ health }, 'WhatsApp gateway READY (socket healthy)');
-        }
-        return;
-      }
-
-      this.logger.warn({ health }, 'WhatsApp socket is not healthy');
-
-      if (
-        health.reason === 'NO_PAGE' ||
-        health.reason === 'Socket health check timeout' ||
-        health.wsReadyState === null ||
-        health.state !== 'CONNECTED' ||
-        health.stream === 'DISCONNECTED'
-      ) {
-        await this.restartClient('socket is not OPEN');
-      }
-
-      await delay(500);
-    }
-
-    const error = new Error('WhatsApp belum siap mengirim: koneksi WebSocket belum OPEN.');
-    error.code = 'WHATSAPP_NOT_READY';
-    throw error;
-  }
-
-  async assertReady() {
-    await this.ensureSocketHealthy();
-
+  assertReady() {
     if (!this.client || this.state !== 'READY') {
-      const error = new Error('WhatsApp belum siap mengirim.');
+      const error = new Error('WhatsApp belum terhubung. Scan QR terlebih dahulu.');
       error.code = 'WHATSAPP_NOT_READY';
       throw error;
     }
@@ -510,7 +298,7 @@ class WhatsAppManager {
     const normalized = normalizePhone(phone);
     if (!isValidIndonesianPhone(normalized)) throw new Error('Format nomor WhatsApp tidak valid.');
     if (typeof message !== 'string' || !message.trim()) throw new Error('Pesan WhatsApp kosong.');
-    await this.assertReady();
+    this.assertReady();
 
     const numberId = await this.client.getNumberId(normalized);
     if (!numberId) throw new Error('Nomor tidak terdaftar di WhatsApp.');
@@ -523,7 +311,7 @@ class WhatsAppManager {
   async sendPdf(phone, pdfUrl, caption = '') {
     const normalized = normalizePhone(phone);
     if (!isValidIndonesianPhone(normalized)) throw new Error('Format nomor WhatsApp tidak valid.');
-    await this.assertReady();
+    this.assertReady();
 
     const response = await fetch(pdfUrl);
     if (!response.ok) throw new Error(`Gagal mengambil PDF: HTTP ${response.status}`);
@@ -541,7 +329,7 @@ class WhatsAppManager {
 
   async sendBulk(numbers, message, delayMs = this.messageDelay) {
     if (!Array.isArray(numbers) || numbers.length === 0) throw new Error('numbers harus array dan tidak boleh kosong');
-    await this.assertReady();
+    this.assertReady();
     const results = [];
     for (const rawNumber of [...new Set(numbers.map((value) => normalizePhone(String(value))))]) {
       try {
