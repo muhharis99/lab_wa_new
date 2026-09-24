@@ -121,6 +121,23 @@ app.use((err, req, res, next) => { logger.error({ err }, 'Unhandled HTTP error')
 process.on('unhandledRejection', (reason) => logger.error({ reason }, 'Unhandled promise rejection'));
 process.on('uncaughtException', (error) => { logger.fatal({ err: error }, 'Uncaught exception'); process.exit(1); });
 
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info({ signal }, 'Shutting down WhatsApp Gateway');
+  try {
+    await whatsapp.close();
+  } catch (error) {
+    logger.error({ err: error }, 'Graceful shutdown failed');
+  } finally {
+    process.exit(0);
+  }
+}
+
+process.once('SIGINT', () => { void gracefulShutdown('SIGINT'); });
+process.once('SIGTERM', () => { void gracefulShutdown('SIGTERM'); });
+
 async function start() {
   app.listen(port, host, () => logger.info({ host, port }, 'WhatsApp Gateway server started'));
 
