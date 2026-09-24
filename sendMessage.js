@@ -16,6 +16,33 @@ function isValidIndonesianPhone(value) {
   return /^62\d{8,15}$/.test(normalizePhone(value));
 }
 
+function isBrowserAlreadyRunningError(error) {
+  return /The browser is already running for/i.test(String(error?.message || error));
+}
+
+function getChromiumLockFiles(userDataDir) {
+  return [
+    'SingletonCookie',
+    'SingletonLock',
+    'SingletonSocket',
+  ].map((name) => path.join(userDataDir, name));
+}
+
+function removeStaleChromiumLocks(userDataDir, logger) {
+  if (!fs.existsSync(userDataDir)) return;
+
+  for (const file of getChromiumLockFiles(userDataDir)) {
+    try {
+      if (fs.existsSync(file)) {
+        fs.rmSync(file, { force: true });
+        logger.warn({ file }, 'Removed stale Chromium profile lock');
+      }
+    } catch (error) {
+      logger.warn({ file, err: error }, 'Could not remove Chromium profile lock');
+    }
+  }
+}
+
 class WhatsAppManager {
   constructor({ logger = P({ level: process.env.LOG_LEVEL || 'info' }) } = {}) {
     this.logger = logger;
@@ -30,6 +57,7 @@ class WhatsAppManager {
     this.sessionPath = path.resolve(process.env.WHATSAPP_SESSION_PATH || './tokens/session01');
     this.messageDelay = Number(process.env.MESSAGE_DELAY_MS || 1500);
     this.maxReconnectDelay = Number(process.env.MAX_RECONNECT_DELAY_MS || 30000);
+    this.chromiumLockRetryCount = Number(process.env.CHROMIUM_LOCK_RETRY_COUNT || 1);
   }
 
   getStatus() {
@@ -104,15 +132,41 @@ class WhatsAppManager {
     this.client = client;
     this.bindEvents(client);
 
-    try {
-      await client.initialize();
-    } catch (error) {
+    let initialized = false;
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= this.chromiumLockRetryCount; attempt += 1) {
+      try {
+        await client.initialize();
+        initialized = true;
+        break;
+      } catch (error) {
+        lastError = error;
+
+        if (!isBrowserAlreadyRunningError(error) || attempt >= this.chromiumLockRetryCount) {
+          break;
+        }
+
+        this.logger.warn(
+          { attempt: attempt + 1, sessionPath: this.sessionPath },
+          'Chromium profile appears locked; cleaning stale lock files and retrying'
+        );
+
+        // Do not delete the WhatsApp auth/session data. Only remove Chromium's
+        // lock marker files, then retry client.initialize().
+        removeStaleChromiumLocks(this.sessionPath, this.logger);
+        await delay(500);
+      }
+    }
+
+    if (!initialized) {
       if (this.client === client) {
         this.client = null;
         this.state = 'ERROR';
-        this.lastError = error.message || String(error);
+        this.lastError = lastError?.message || String(lastError);
       }
-      throw error;
+
+      throw lastError || new Error('WhatsApp client failed to initialize.');
     }
   }
 
