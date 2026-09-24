@@ -58,6 +58,7 @@ class WhatsAppManager {
     this.messageDelay = Number(process.env.MESSAGE_DELAY_MS || 1500);
     this.maxReconnectDelay = Number(process.env.MAX_RECONNECT_DELAY_MS || 30000);
     this.chromiumLockRetryCount = Number(process.env.CHROMIUM_LOCK_RETRY_COUNT || 1);
+    this.initializeTimeoutMs = Number(process.env.WHATSAPP_INIT_TIMEOUT_MS || 120000);
   }
 
   getStatus() {
@@ -105,7 +106,7 @@ class WhatsAppManager {
         dataPath: this.sessionPath,
       }),
       puppeteer: {
-        headless: true,
+        headless: 'new',
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
@@ -137,7 +138,15 @@ class WhatsAppManager {
 
     for (let attempt = 0; attempt <= this.chromiumLockRetryCount; attempt += 1) {
       try {
-        await client.initialize();
+        await Promise.race([
+          client.initialize(),
+          new Promise((_, reject) =>
+            setTimeout(
+              () => reject(new Error(`WhatsApp initialization timeout after ${this.initializeTimeoutMs} ms`)),
+              this.initializeTimeoutMs
+            )
+          ),
+        ]);
         initialized = true;
         break;
       } catch (error) {
