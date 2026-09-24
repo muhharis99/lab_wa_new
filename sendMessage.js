@@ -1,6 +1,5 @@
 const path = require('path');
 const fs = require('fs');
-const { execFile } = require('child_process');
 const qrcode = require('qrcode-terminal');
 const P = require('pino');
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
@@ -17,59 +16,7 @@ function isValidIndonesianPhone(value) {
   return /^62\d{8,15}$/.test(normalizePhone(value));
 }
 
-function isBrowserAlreadyRunningError(error) {
-  return /The browser is already running for/i.test(String(error?.message || error));
-}
 
-function getChromiumLockFiles(userDataDir) {
-  return [
-    'SingletonCookie',
-    'SingletonLock',
-    'SingletonSocket',
-  ].map((name) => path.join(userDataDir, name));
-}
-
-function removeStaleChromiumLocks(userDataDir, logger) {
-  if (!fs.existsSync(userDataDir)) return;
-
-  for (const file of getChromiumLockFiles(userDataDir)) {
-    try {
-      if (fs.existsSync(file)) {
-        fs.rmSync(file, { force: true });
-        logger.warn({ file }, 'Removed stale Chromium profile lock');
-      }
-    } catch (error) {
-      logger.warn({ file, err: error }, 'Could not remove Chromium profile lock');
-    }
-  }
-}
-
-function terminateChromiumUsingProfile(userDataDir, logger) {
-  if (process.platform !== 'win32' || !userDataDir) return Promise.resolve();
-
-  const normalizedProfile = path.resolve(userDataDir).replace(/\\/g, '\\\\');
-  const command = [
-    '$profile = [IO.Path]::GetFullPath(\'' + normalizedProfile.replace(/'/g, "''") + '\');',
-    '$procs = Get-CimInstance Win32_Process | Where-Object { $_.Name -in @("chrome.exe","chromium.exe","msedge.exe") -and $_.CommandLine -and $_.CommandLine -like ("*" + $profile + "*") };',
-    '$procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Output $_.ProcessId }'
-  ].join(' ');
-
-  return new Promise((resolve) => {
-    execFile(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command],
-      { windowsHide: true, timeout: 10000 },
-      (error, stdout) => {
-        if (error) {
-          logger.warn({ err: error, userDataDir }, 'Could not inspect/terminate Chromium profile process');
-        }
-        const pids = String(stdout || '').trim();
-        if (pids) logger.warn({ userDataDir, pids }, 'Terminated Chromium process holding WhatsApp profile');
-        resolve();
-      }
-    );
-  });
-}
 
 class WhatsAppManager {
   constructor({ logger = P({ level: process.env.LOG_LEVEL || 'info' }) } = {}) {
@@ -79,17 +26,12 @@ class WhatsAppManager {
     this.qr = null;
     this.lastError = null;
     this.starting = null;
-    this.reconnectTimer = null;
-    this.reconnectAttempt = 0;
     this.stopped = false;
     this.sessionPath = path.resolve(process.env.WHATSAPP_SESSION_PATH || './tokens/session01');
     this.clientId = process.env.WHATSAPP_CLIENT_ID || 'lab-wa-gateway';
-    this.browserProfilePath = path.join(this.sessionPath, `session-${this.clientId}`);
     this.messageDelay = Number(process.env.MESSAGE_DELAY_MS || 1500);
-    this.maxReconnectDelay = Number(process.env.MAX_RECONNECT_DELAY_MS || 30000);
-    this.chromiumLockRetryCount = Number(process.env.CHROMIUM_LOCK_RETRY_COUNT || 1);
-    this.initializeTimeoutMs = Number(process.env.WHATSAPP_INIT_TIMEOUT_MS || 120000);
   }
+
 
   getStatus() {
     const ready = this.state === 'READY' && Boolean(this.client);
@@ -128,7 +70,18 @@ class WhatsAppManager {
     this.lastError = null;
     this.logger.info('WhatsApp connecting');
 
-    fs.mkdirSync(this.sessionPath, { recursive: true });
+    fs.  async initialize() {
+    if (this.client) {
+      const status = this.getStatus();
+      if (status.ready || ['CONNECTING', 'AUTHENTICATED', 'QR_REQUIRED'].includes(this.state)) return;
+      try { await this.client.destroy(); } catch {}
+      this.client = null;
+    }
+
+    this.state = 'CONNECTING';
+    this.qr = null;
+    this.lastError = null;
+    this.logger.info('WhatsApp connecting');
 
     const client = new Client({
       authStrategy: new LocalAuth({
@@ -136,7 +89,7 @@ class WhatsAppManager {
         dataPath: this.sessionPath,
       }),
       puppeteer: {
-        headless: 'new',
+        headless: true,
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
@@ -150,77 +103,31 @@ class WhatsAppManager {
           '--disable-default-apps',
           '--disable-sync',
           '--disable-translate',
+          '--disable-features=Translate,MediaRouter,OptimizationHints,AutofillServerCommunication',
           '--metrics-recording-only',
           '--mute-audio',
           '--no-first-run',
           '--no-default-browser-check',
         ],
       },
-      takeoverOnConflict: true,
-      takeoverTimeoutMs: 0,
     });
 
     this.client = client;
     this.bindEvents(client);
 
-    let initialized = false;
-    let lastError = null;
-
-    for (let attempt = 0; attempt <= this.chromiumLockRetryCount; attempt += 1) {
-      try {
-        await Promise.race([
-          client.initialize(),
-          new Promise((_, reject) =>
-            setTimeout(
-              () => reject(new Error(`WhatsApp initialization timeout after ${this.initializeTimeoutMs} ms`)),
-              this.initializeTimeoutMs
-            )
-          ),
-        ]);
-        initialized = true;
-        break;
-      } catch (error) {
-        lastError = error;
-
-        if (!isBrowserAlreadyRunningError(error) || attempt >= this.chromiumLockRetryCount) {
-          break;
-        }
-
-        this.logger.warn(
-          { attempt: attempt + 1, sessionPath: this.sessionPath },
-          'Chromium profile appears locked; cleaning stale lock files and retrying'
-        );
-
-        // LocalAuth uses session-<clientId> as Puppeteer's actual userDataDir.
-        // Clean that profile, not the parent session directory.
-        try { await client.destroy(); } catch {}
-        await terminateChromiumUsingProfile(this.browserProfilePath, this.logger);
-        removeStaleChromiumLocks(this.browserProfilePath, this.logger);
-        await delay(700);
-      }
-    }
-
-    if (!initialized) {
-      // Important: client.initialize() may have started Chromium before failing.
-      // Always destroy that client here, otherwise its Chrome process can keep
-      // session-lab-wa-gateway locked and every reconnect will fail with
-      // "The browser is already running".
-      try {
-        await client.destroy();
-      } catch (destroyError) {
-        this.logger.warn({ err: destroyError }, 'Could not destroy failed WhatsApp client');
-      }
-      await terminateChromiumUsingProfile(this.browserProfilePath, this.logger);
-
+    try {
+      await client.initialize();
+    } catch (error) {
       if (this.client === client) {
         this.client = null;
         this.state = 'ERROR';
-        this.lastError = lastError?.message || String(lastError);
+        this.lastError = error.message || String(error);
       }
-
-      throw lastError || new Error('WhatsApp client failed to initialize.');
+      try { await client.destroy(); } catch {}
+      throw error;
     }
   }
+
 
   bindEvents(client) {
     client.on('qr', (qr) => {
@@ -269,21 +176,16 @@ class WhatsAppManager {
   }
 
   scheduleReconnect() {
-    if (this.stopped || this.reconnectTimer || this.starting) return;
-    const delayMs = Math.min(1000 * 2 ** this.reconnectAttempt, this.maxReconnectDelay);
-    this.reconnectAttempt += 1;
-    this.reconnectTimer = setTimeout(async () => {
-      this.reconnectTimer = null;
+    if (this.stopped || this.starting) return;
+    setTimeout(async () => {
       if (this.stopped) return;
       try {
         await this.start();
       } catch (error) {
         this.lastError = error.message || String(error);
         this.logger.error({ err: error }, 'WhatsApp reconnect failed');
-        this.scheduleReconnect();
       }
-    }, delayMs);
-    this.logger.info({ delayMs, attempt: this.reconnectAttempt }, 'WhatsApp reconnect scheduled');
+    }, 3000);
   }
 
   assertReady() {
@@ -294,104 +196,4 @@ class WhatsAppManager {
     }
   }
 
-  async sendText(phone, message) {
-    const normalized = normalizePhone(phone);
-    if (!isValidIndonesianPhone(normalized)) throw new Error('Format nomor WhatsApp tidak valid.');
-    if (typeof message !== 'string' || !message.trim()) throw new Error('Pesan WhatsApp kosong.');
-    this.assertReady();
 
-    const numberId = await this.client.getNumberId(normalized);
-    if (!numberId) throw new Error('Nomor tidak terdaftar di WhatsApp.');
-
-    const sent = await this.client.sendMessage(numberId._serialized, message, { sendSeen: false });
-    this.logger.info({ phone: normalized, messageId: sent?.id?._serialized || null }, 'WhatsApp message sent');
-    return { phone: normalized, messageId: sent?.id?._serialized || null };
-  }
-
-  async sendPdf(phone, pdfUrl, caption = '') {
-    const normalized = normalizePhone(phone);
-    if (!isValidIndonesianPhone(normalized)) throw new Error('Format nomor WhatsApp tidak valid.');
-    this.assertReady();
-
-    const response = await fetch(pdfUrl);
-    if (!response.ok) throw new Error(`Gagal mengambil PDF: HTTP ${response.status}`);
-    const buffer = Buffer.from(await response.arrayBuffer());
-    if (buffer.length > 16 * 1024 * 1024) throw new Error('PDF lebih dari 16MB');
-
-    const numberId = await this.client.getNumberId(normalized);
-    if (!numberId) throw new Error('Nomor tidak terdaftar di WhatsApp.');
-
-    const media = new MessageMedia('application/pdf', buffer.toString('base64'), 'Hasil-Pemeriksaan-Laboratorium.pdf');
-    const sent = await this.client.sendMessage(numberId._serialized, media, { caption, sendSeen: false });
-    this.logger.info({ phone: normalized, messageId: sent?.id?._serialized || null }, 'WhatsApp PDF sent');
-    return { phone: normalized, messageId: sent?.id?._serialized || null };
-  }
-
-  async sendBulk(numbers, message, delayMs = this.messageDelay) {
-    if (!Array.isArray(numbers) || numbers.length === 0) throw new Error('numbers harus array dan tidak boleh kosong');
-    this.assertReady();
-    const results = [];
-    for (const rawNumber of [...new Set(numbers.map((value) => normalizePhone(String(value))))]) {
-      try {
-        results.push({ success: true, ...(await this.sendText(rawNumber, message)) });
-      } catch (error) {
-        results.push({ success: false, phone: rawNumber, message: error.message || String(error) });
-        this.logger.error({ err: error, phone: rawNumber }, 'WhatsApp message failed');
-      }
-      if (delayMs > 0) await delay(delayMs);
-    }
-    return results;
-  }
-
-  async close() {
-    this.stopped = true;
-
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-
-    const client = this.client;
-    this.client = null;
-
-    if (client) {
-      try {
-        await client.destroy();
-      } catch (error) {
-        this.logger.warn({ err: error }, 'WhatsApp client close returned an error');
-      }
-    }
-
-    this.state = 'STOPPED';
-    this.qr = null;
-    this.lastError = null;
-  }
-
-  async logout() {
-    this.stopped = true;
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-
-    const client = this.client;
-    this.client = null;
-    this.state = 'LOGGED_OUT';
-    this.qr = null;
-    this.lastError = null;
-
-    if (client) {
-      try { await client.logout(); } catch (error) { this.logger.warn({ err: error }, 'WhatsApp logout returned an error'); }
-      try { await client.destroy(); } catch {}
-    }
-
-    await delay(300);
-    try {
-      if (fs.existsSync(this.sessionPath)) fs.rmSync(this.sessionPath, { recursive: true, force: true });
-    } catch (error) {
-      this.logger.warn({ err: error }, 'Could not clear WhatsApp session directory');
-    }
-  }
-}
-
-module.exports = { WhatsAppManager, normalizePhone };
