@@ -121,6 +121,16 @@ app.use((err, req, res, next) => { logger.error({ err }, 'Unhandled HTTP error')
 process.on('unhandledRejection', (reason) => logger.error({ reason }, 'Unhandled promise rejection'));
 process.on('uncaughtException', (error) => { logger.fatal({ err: error }, 'Uncaught exception'); process.exit(1); });
 
-async function start() { await whatsapp.start(); app.listen(port, host, () => logger.info({ host, port }, 'WhatsApp Gateway server started')); }
+async function start() {
+  app.listen(port, host, () => logger.info({ host, port }, 'WhatsApp Gateway server started'));
+
+  // Do not block the HTTP server while WhatsApp Web/Chromium initializes.
+  try {
+    await whatsapp.start();
+  } catch (error) {
+    logger.error({ err: error }, 'WhatsApp initial start failed; reconnect loop will continue');
+    whatsapp.scheduleReconnect();
+  }
+}
 start().catch((error) => { logger.fatal({ err: error }, 'Failed to start server'); process.exit(1); });
 module.exports = { app, whatsapp };
